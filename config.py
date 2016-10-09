@@ -9,6 +9,7 @@ iteration = 50
 select_best_at_end_iteration = False
 num_best_select = 1
 filename_to_save_best = "bst_rbt.pk"
+save_at_each_turn = True
 
 # Has to be a number between 0.0 and 1.0 (because of random.random)
 crossover_percentage = 0.25

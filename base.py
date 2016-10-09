@@ -158,6 +158,9 @@ def evolution(pop, toolbox):
     for ind, fit in zip(invalid_ind, fitnesses):
       ind.fitness.values = fit
     pop = new_pop
+
+    if config.save_at_each_turn:
+      write_population(population)
   print("End Evolution\n%s" % pop)
   return pop
 
