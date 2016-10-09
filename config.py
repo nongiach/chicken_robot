@@ -1,12 +1,17 @@
-from deap import tools
+from deap import tools, gp
 
+saving = True
 file_save = "rbt.pk"
-population_start = 4
-genes_start = 4
-iteration = 2
+verbose = True
+population_start = 300
+genes_start = 30
+iteration = 50
+select_best_at_end_iteration = False
+num_best_select = 1
+filename_to_save_best = "bst_rbt.pk"
 
 # Has to be a number between 0.0 and 1.0 (because of random.random)
-mate_percentage = 0.90
+crossover_percentage = 0.25
 # Croos Over function and arguments from deap
 # Can be: 
 # tools.cxUniform,
@@ -16,17 +21,24 @@ mate_percentage = 0.90
 crossover = [
   tools.cxMessyOnePoint # cxTwoPoint
 ]
-
-# Has to be a number between 0.0 and 1.0 (because of random.random)
-mutate_percentage = 0.90
-mutate = tools.mutUniformInt # mutFlipBit
-kwargs_mutate = {
-  'indpb':0.90,
-  'low':0,
-  'up':300
+kwargs_crossover = {
 }
 
-selection = tools.selTournament
+# Has to be a number between 0.0 and 1.0 (because of random.random)
+mutate_percentage = 0.35
+mutate = tools.mutGaussian  #mutUniformInt
+kwargs_mutate = {
+  'indpb':0.45,
+  'mu':12,
+  'sigma':2
+#  'low':0,
+#  'up':300
+}
+
+selection = tools.selDoubleTournament # tools.selTournament
 kwargs_selection = {
-  'tournsize':3
+  'fitness_size':3,
+  'parsimony_size':2,
+  'fitness_first':False
+#  'tournsize':3
 }
