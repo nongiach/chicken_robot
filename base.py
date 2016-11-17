@@ -1,7 +1,27 @@
 import random, config, vrep, math, time, copy, pickle
 from deap import base, creator, tools
+from functools import partial
+import threading
 #from algo import Loop
 random.seed()
+
+IHROBOT=3
+
+def get_robot_object(clientID, n=0):
+  opmode = vrep.simx_opmode_oneshot_wait
+  vrep_get = partial(vrep.simxGetObjectHandle, clientID=clientID, operationMode=opmode)
+  index = "" if n == 0 else "#{}".format(n - 1)
+  ret_test, robotHandle = vrep_get(objectName="2W1A" + index)
+  if ret_test != 0:
+    _, r = vrep_get(objectName="2W1A")
+    vrep.simxCopyPasteObjects(clientID, [r], opmode)
+  ret1, wristHandle = vrep_get(objectName="WristMotor" + index)
+  ret2, elbowHandle = vrep_get(objectName="ElbowMotor" + index)
+  ret3, shoulderHandle = vrep_get(objectName="ShoulderMotor" + index)
+  ret4, robotHandle = vrep_get(objectName="2W1A" + index)
+  if ret1 == ret2 == ret3 == ret4 == 0:
+    return wristHandle, elbowHandle, shoulderHandle, robotHandle
+  raise("vrep_get error (be sure the chicken robot is there) 2W1A0{}".format(index))  
 
 # simx_opmode_blocking
 # http://www.coppeliarobotics.com/helpFiles/en/remoteApiConstants.htm
@@ -10,29 +30,23 @@ def init_simulation(opmode = vrep.simx_opmode_oneshot_wait):
   vrep.simxFinish(-1)
   # Connect to V-REP remote server              # Args could be set to False if real remote
   clientID = vrep.simxStart('127.0.0.1', 19997, True, True, 5000, 5)
-
+  handlers = []
+  pos_inits =  []
+  
   if clientID == -1:
     raise Exception('Not Connected to remote API server')
-  ret = []
-  # Try to retrieve motors and robot handlers
-  # don't rely on the automatic name adjustment mechanism
-  # http://www.coppeliarobotics.com/helpFiles/en/remoteApiFunctionsPython.htm#simxGetObjectHandle
-  sret, hret = vrep.simxGetObjectHandle(clientID, "WristMotor", opmode)
-  if sret == -1:
-    raise Exception('Can\'t Connecte to motor')
-  ret.append(hret)
-  sret, hret = vrep.simxGetObjectHandle(clientID, "ElbowMotor", opmode)
-  if sret == -1:
-    raise Exception('Can\'t Connecte to motor')
-  ret.append(hret)
-  sret, hret = vrep.simxGetObjectHandle(clientID, "ShoulderMotor", opmode)
-  if sret == -1:
-    raise Exception('Can\'t Connecte to motor')
-  ret.append(hret)
-  sret, robot = vrep.simxGetObjectHandle(clientID, "2W1A", opmode)
-  if sret == -1:
-    raise Exception('Can\'t Connecte to motor')
-  return clientID, ret, robot
+
+  stop_simulation(clientID, opmode)
+  handlers.append(get_robot_object(clientID))
+  pos_inits.append(get_position(clientID, handlers[0][IHROBOT]))
+  vrep.simxSetObjectPosition(clientID, handlers[0][IHROBOT], -1, \
+                               [0.0, config.pos_x_start, 0.075], opmode)
+  for i in range(1, config.nb_robots):
+    handlers.append(get_robot_object(clientID, n=i))
+    vrep.simxSetObjectPosition(clientID, handlers[i][IHROBOT], -1, \
+                               [0.0, config.pos_x_start + (0.75 * i), 0.075], opmode)
+    pos_inits.append(get_position(clientID, handlers[i][IHROBOT]))
+  return clientID, handlers, pos_inits
 
 def stop_simulation(clientID, opmode=vrep.simx_opmode_oneshot_wait):
   vrep.simxStopSimulation(clientID, opmode)
@@ -58,28 +72,33 @@ class Gene(int):
     r = Gene(self)
     r.motor = self.motor
     return r
+
+  def __str__(self):
+    return "m[%s]:%s" % (self.motor, int(self))
+  def __repr__(self):
+    return str(self)
   
-def l_gen(motors):
+def l_gen():
   g = Gene(random.randint(0, 300))
-  g.motor = motors[random.randint(0, len(motors) - 1)]
+  g.motor = random.randint(0, 2)
   return g
 
-def init_deap_lib(clientID, roboth, motors, pos_init):
+def init_deap_lib(clientID, handlers, pos_inits):
   # Set max Value for Problem resolution.
   creator.create("FitnessMax", base.Fitness, weights=(1.0,))
   # define An individue
   creator.create("Individual", list, fitness=creator.FitnessMax)
   toolbox = base.Toolbox()
 
-  toolbox.register("generator_gene", lambda: l_gen(motors))
+#  toolbox.register("generator_gene", lambda: l_gen(motors))
 
   # Structure initializers
   toolbox.register("individual", tools.initRepeat, creator.Individual,
-                   toolbox.generator_gene, config.genes_start)
+                   l_gen, config.genes_start) #toolbox.generator_gene
   toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
   # Register function to eval individual
-  toolbox.register("evaluate", eval_individual, clientID, roboth, pos_init)
+  toolbox.register("evaluate", eval_pop, clientID, handlers, pos_inits)
   # CrossOver Choose by config
   toolbox.register("crossover", *config.crossover, **config.kwargs_crossover)
   # Mutation choose in configuration 
@@ -88,28 +107,45 @@ def init_deap_lib(clientID, roboth, motors, pos_init):
   toolbox.register("select", config.selection, **config.kwargs_selection)
   return toolbox
 
-def move_motor_angle(clientID, motor, angle, opmode=vrep.simx_opmode_oneshot_wait):
-   vrep.simxSetJointTargetPosition(clientID, motor, math.radians(angle), opmode)
+def move_motor_angle(clientID, motor, angle, opmode=vrep.simx_opmode_oneshot):
+  while angle > 300:
+    angle /= 2
+#  if config.verbose:
+#    print("[%s] %s" % (motor, angle))
+  vrep.simxSetJointTargetPosition(clientID, motor, math.radians(angle), opmode)
 
-
-def eval_individual(clientID, roboth, pos_init, individual):
+def eval_pop(clientID, handlers, pos_inits, pop):
+  x = 0
+  for x in range(0, len(pop), config.nb_robots):
+    _pop = pop[x:x+config.nb_robots]
+    start_simulation(clientID)
+    # Threading
+    for _handlers, pos_init, ind in zip( handlers, pos_inits, _pop):
+      args=(clientID, _handlers, pos_init, ind)
+      t = threading.Thread(group=None, target=eval_individual, args=args, daemon=True)
+      t.start()
+    # Wait until  Thread complete
+    while threading.active_count() > 1:
+      time.sleep(0.2)
+    
+    stop_simulation(clientID)
+   
+def eval_individual(clientID, handler, pos_init, individual):
   """
     Eval an individue.
     For that run the simulation and calculate the distance.
   """
-  start_simulation(clientID)
+  roboth, handler =  handler[-1], handler[:-1]
   for angle in individual:
-    if config.verbose:
-      print("[%s] %s" % (angle.motor, angle))
-    move_motor_angle(clientID, angle.motor, angle)
-    time.sleep(2)
+    move_motor_angle(clientID, handler[angle.motor], copy.copy(angle))
+    time.sleep(0.2)
   new_pos = get_position(clientID, roboth)
-  stop_simulation(clientID)
   dist = put_value_on_position(pos_init, new_pos)
   value = dist / float(len(individual))
+  individual.fitness.value = (value, )
   if config.verbose:
     print("Value of this individual %s" % value)
-  return (value, ) # Need to be return as an iterable
+  return None
 
 def put_value_on_position(pos_init, new_pos):
   dist = math.sqrt((new_pos[0] - pos_init[0])**2 + (new_pos[1] - pos_init[1])**2)
@@ -129,8 +165,11 @@ def evolution(pop, toolbox):
   for i in range(config.iteration):
     # Select the next generation individuals
     print("Iteration %d/%d" % (i, config.iteration))
-    print("Population %s" % pop)
-    new_pop = [toolbox.clone(x) for x in toolbox.select(pop, len(pop))]
+    check_population(pop)
+    if config.verbose:
+      print("Population %s" % len(pop))
+      print(pop)
+    new_pop = [toolbox.clone(x) for x in toolbox.select(pop, config.population_start)]
     # Apply crossover - we could also take radom ind from new_pop
     #
     
@@ -139,7 +178,7 @@ def evolution(pop, toolbox):
         toolbox.crossover(child1, child2)
         del child1.fitness.values
         del child2.fitness.values
-    #
+
     new_pop = [n for n in new_pop if len(n) != 0]
     # apply mutation
     for mutant in new_pop:
@@ -149,41 +188,54 @@ def evolution(pop, toolbox):
         for i in range(len(org)):
           if not type(mts[i]) is Gene:
             mts[i] = Gene(mts[i])
-            mts[i].motor = org[i].motor
+            # # Try out a new motor
+            mts[i].motor = org[i].motor # random.randint(0, 2) #  org[i].motor
         del mutant.fitness.values
 
     # Evaluate the individuals that haven't been
     invalid_ind = [ind for ind in new_pop if not ind.fitness.valid]
-    fitnesses = map(toolbox.evaluate, invalid_ind)
-    for ind, fit in zip(invalid_ind, fitnesses):
-      ind.fitness.values = fit
+    toolbox.evaluate(invalid_ind)
     pop = new_pop
-
     if config.save_at_each_turn:
-      write_population(population)
+      write_population(pop)
   print("End Evolution\n%s" % pop)
   return pop
 
 def write_population(population, path=None):
-  p = p if path else config.file_save
+  p = path if path else config.file_save
   with open(p, "wb") as f:
     pickle.dump(population, f)
+  print("State saved @%s" % p)
 
-def load_population(savedrobot=None):
-  f = savedrobot if type(savedrobot) is str else config.file_save
-  if not savedrobot and type(savedrobot) is bool:
-    return None
-  with open(config.file_save, "rb") as f:
+def load_population(toolbox, savedrobot=None):
+  filen = savedrobot if type(savedrobot) is str else config.file_save
+  if not savedrobot:
+    return toolbox.population(n=config.population_start)
+  with open(filen, "rb") as f:
     pop = pickle.load(f)
+  if config.verbose:
+    print("Log from file ", filen, " size population ", len(pop))
   return pop
 
-def main(opmode, clientID, motors, roboth, pos_init, toolbox, savedrobot=None):
+def check_population(population):
+  for ind in population:
+    for i in range(len(ind)):
+      if not type(ind[i]) is Gene:
+        m = randon.randint(0, 2)
+      else:
+        m = ind[i].motor
+      if ind[i] > 300:
+        while ind[i] > 300:
+          ind[i] /= 2
+        ind[i] = Gene(ind[i])
+        ind[i].motor = m
+
+def main(opmode, clientID, handlers, pos_inits, toolbox, savedrobot=None):
   # Get initial Popluation from File or from a new population
   pop = savedrobot if savedrobot else toolbox.population(n=config.population_start)
 
-  fitnesses = list(map(toolbox.evaluate, pop))
-  for ind, fit in zip(pop, fitnesses):
-    ind.fitness.values = fit
+  check_population(pop)
+  toolbox.evaluate(pop)
   # Launch evolution
   population = evolution(pop, toolbox)
   if config.select_best_at_end_iteration:
@@ -194,14 +246,13 @@ def main(opmode, clientID, motors, roboth, pos_init, toolbox, savedrobot=None):
 
 def preload_main(savedrobot=None):
   opmode = vrep.simx_opmode_oneshot_wait
-  clientID, motors, roboth = init_simulation()
-  stop_simulation(clientID, opmode)
-  pos_init = get_position(clientID, roboth, opmode=opmode)
-  toolbox = init_deap_lib(clientID, roboth, motors, pos_init)
-
-  if savedrobot:
-    savedrobot = load_population(savedrobot=savedrobot)
-  return main(opmode, clientID, motors, roboth, pos_init, toolbox, savedrobot=savedrobot)
+  clientID, handlers, pos_inits = init_simulation() # motors, roboth
+  
+#  stop_simulation(clientID, opmode)
+#  pos_init = get_position(clientID, roboth, opmode=opmode)
+  toolbox = init_deap_lib(clientID, handlers, pos_inits)
+  savedrobot = load_population(toolbox, savedrobot=savedrobot)
+  return main(opmode, clientID, handlers, pos_inits, toolbox, savedrobot=savedrobot)
   
  # l = Loop(configfile, savedrobot=savedrobot)
  # l()
@@ -213,22 +264,10 @@ if __name__ == '__main__':
   if len(sys.argv) >= 2:
     if sys.argv[1] == "False":
       savedrobot = False
-    elif sys.argv[1] == "True":
+    elif sys.argv[1] == "True" or sys.argv[1] == "true":
       savedrobot = True
     else:
       savedrobot = sys.argv[1]
   preload_main(savedrobot=savedrobot)
 
-
-  
-
-
-# print motorsHandlers['Gyro']['status']
-  # print vrep.simxGetObjectGroupData(clientID, motorsHandlers['Gyro']['handler'], 0, vrep.simx_opmode_oneshot_wait)
-  # print vrep.simxGetObjectGroupData(clientID, motorsHandlers['Gyro']['handler'], 1, vrep.simx_opmode_oneshot_wait)
-  # print vrep.simxGetObjectGroupData(clientID, motorsHandlers['Gyro']['handler'], 2, vrep.simx_opmode_oneshot_wait)
-  # print vrep.simxGetObjectOrientation(clientID, motorsHandlers['Gyro']['handler'], -1, vrep.simx_opmode_oneshot_wait)
-  # data=simTubeRead(gyroCommunicationTube)
-  #  if (data) 
-  #    angularVariations=simUnpackFloats(data)
 
